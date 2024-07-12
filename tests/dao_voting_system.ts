@@ -1,163 +1,209 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { assert } from "chai";
 import { DaoVotingSystem } from "../target/types/dao_voting_system";
-import {
-  TOKEN_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  getAssociatedTokenAddress,
-  createMint,
-  createAssociatedTokenAccount,
-  mintTo,
-} from "@solana/spl-token";
+import { TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, createMint, getOrCreateAssociatedTokenAccount, mintTo } from "@solana/spl-token";
+import { expect } from "chai";
 
-describe("dao_voting_system", () => {
+describe("dao-voting-system", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
   const program = anchor.workspace.DaoVotingSystem as Program<DaoVotingSystem>;
 
-  const user = anchor.web3.Keypair.generate();
-  const protocolWallet = anchor.web3.Keypair.generate();
-
-  let mint: anchor.web3.PublicKey;
-  let userTokenAccount: anchor.web3.PublicKey;
+  let rewardMint: anchor.web3.PublicKey;
+  let dao: anchor.web3.PublicKey;
+  let rewardVault: anchor.web3.PublicKey;
   let proposal: anchor.web3.PublicKey;
-  let rewardPool: anchor.web3.PublicKey;
-  let rewardPoolBump: number;
-  let rewardPoolTokenAccount: anchor.web3.PublicKey;
+  let user1: anchor.web3.Keypair;
+  let user2: anchor.web3.Keypair;
+  let user1TokenAccount: anchor.web3.PublicKey;
+  let user2TokenAccount: anchor.web3.PublicKey;
 
   before(async () => {
-    // Airdrop SOL to the user
-    await provider.connection.confirmTransaction(
-      await provider.connection.requestAirdrop(user.publicKey, 1000000000)
-    );
-
-    // Create mint
-    mint = await createMint(
+    // Create a new mint for reward tokens
+    rewardMint = await createMint(
       provider.connection,
-      user,
-      user.publicKey,
+      provider.wallet.payer,
+      provider.wallet.publicKey,
       null,
-      0
+      6
     );
 
-    // Create user token account
-    userTokenAccount = await createAssociatedTokenAccount(
-      provider.connection,
-      user,
-      mint,
-      user.publicKey
-    );
-
-    // Derive the reward pool PDA
-    [rewardPool, rewardPoolBump] = await anchor.web3.PublicKey.findProgramAddress(
-      [Buffer.from("reward_pool"), mint.toBuffer()],
+    // Generate DAO address
+    [dao] = await anchor.web3.PublicKey.findProgramAddress(
+      [Buffer.from("dao")],
       program.programId
     );
 
-    // Create reward pool token account
-    rewardPoolTokenAccount = await getAssociatedTokenAddress(
-      mint,
-      rewardPool,
-      true
+    // Generate reward vault address
+    rewardVault = await anchor.utils.token.associatedAddress({
+      mint: rewardMint,
+      owner: dao
+    });
+
+    // Create users
+    user1 = anchor.web3.Keypair.generate();
+    user2 = anchor.web3.Keypair.generate();
+
+    // Airdrop SOL to users
+    await provider.connection.requestAirdrop(user1.publicKey, 1000000000);
+    await provider.connection.requestAirdrop(user2.publicKey, 1000000000);
+
+    // Initialize DAO
+    const [daoPda, bump] = await anchor.web3.PublicKey.findProgramAddress(
+      [Buffer.from("dao")],
+      program.programId
     );
 
-    // Initialize reward pool
     await program.methods
-      .initializeRewardPool(rewardPoolBump)
+      .initializeDao(bump)
       .accounts({
-        rewardPool: rewardPool,
-        authority: user.publicKey,
-        mint: mint,
+        dao: daoPda,
+        rewardVault: rewardVault,
+        rewardMint: rewardMint,
+        authority: provider.wallet.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: anchor.web3.SystemProgram.programId,
         rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
-      .signers([user])
       .rpc();
 
-    // Mint tokens to the user's account
+    // Mint reward tokens to the vault
     await mintTo(
       provider.connection,
-      user,
-      mint,
-      userTokenAccount,
-      user,
-      1000
+      provider.wallet.payer,
+      rewardMint,
+      rewardVault,
+      provider.wallet.payer,
+      1000000000 // 1000 tokens
     );
+  });
 
-    // Mint tokens to the reward pool token account
-    await mintTo(
-      provider.connection,
-      user,
-      mint,
-      rewardPoolTokenAccount,
-      user,
-      1000
-    );
-
-    // Create proposal
-    [proposal] = await anchor.web3.PublicKey.findProgramAddress(
-      [Buffer.from("proposal"), user.publicKey.toBuffer()],
+  it("Creates a proposal", async () => {
+    const description = "Should we implement feature X?";
+    const [proposalPda] = await anchor.web3.PublicKey.findProgramAddress(
+      [Buffer.from("proposal"), new anchor.BN(0).toArrayLike(Buffer, "le", 8)],
       program.programId
     );
 
     await program.methods
-      .createProposal("Proposal description")
+      .createProposal(description)
       .accounts({
-        proposal: proposal,
-        authority: user.publicKey,
+        dao: dao,
+        proposal: proposalPda,
+        authority: provider.wallet.publicKey,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
-      .signers([user])
       .rpc();
+
+    const proposalAccount = await program.account.proposal.fetch(proposalPda);
+    expect(proposalAccount.description).to.equal(description);
+    expect(proposalAccount.votesFor.toNumber()).to.equal(0);
+    expect(proposalAccount.votesAgainst.toNumber()).to.equal(0);
+    expect(proposalAccount.isActive).to.be.true;
+
+    proposal = proposalPda;
   });
 
-  it("Votes on a proposal", async () => {
+  it("Allows users to vote and rewards them", async () => {
+    // User 1 votes in favor
+    user1TokenAccount = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      user1,
+      rewardMint,
+      user1.publicKey
+    ).then(account => account.address);
+
     await program.methods
       .vote(true)
       .accounts({
+        dao: dao,
         proposal: proposal,
-        user: user.publicKey,
-        userTokenAccount: userTokenAccount,
-        rewardPool: rewardPool,
-        rewardPoolTokenAccount: rewardPoolTokenAccount,
+        rewardVault: rewardVault,
+        userTokenAccount: user1TokenAccount,
+        rewardMint: rewardMint,
+        user: user1.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
-      .signers([user])
+      .signers([user1])
       .rpc();
 
-    const account = await program.account.proposal.fetch(proposal);
-    assert.equal(account.votesFor, 1);
-  });
+    // User 2 votes against
+    user2TokenAccount = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      user2,
+      rewardMint,
+      user2.publicKey
+    ).then(account => account.address);
 
-  it("Closes a proposal", async () => {
+    await program.methods
+      .vote(false)
+      .accounts({
+        dao: dao,
+        proposal: proposal,
+        rewardVault: rewardVault,
+        userTokenAccount: user2TokenAccount,
+        rewardMint: rewardMint,
+        user: user2.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .signers([user2])
+      .rpc();
+
+    // Check proposal state
+    const proposalAccount = await program.account.proposal.fetch(proposal);
+    expect(proposalAccount.votesFor.toNumber()).to.equal(1);
+    expect(proposalAccount.votesAgainst.toNumber()).to.equal(1);
+
+    // Check reward balances
+    const user1Balance = await provider.connection.getTokenAccountBalance(user1TokenAccount);
+    const user2Balance = await provider.connection.getTokenAccountBalance(user2TokenAccount);
+
+    expect(user1Balance.value.uiAmount).to.equal(10);
+    expect(user2Balance.value.uiAmount).to.equal(10);
+});
+
+  it("Closes the proposal", async () => {
     await program.methods
       .closeProposal()
       .accounts({
         proposal: proposal,
-        authority: user.publicKey,
+        authority: provider.wallet.publicKey,
       })
-      .signers([user])
       .rpc();
 
-    const account = await program.account.proposal.fetch(proposal);
-    assert.isTrue(account.closed);
+    const proposalAccount = await program.account.proposal.fetch(proposal);
+    expect(proposalAccount.isActive).to.be.false;
   });
 
-  it("Displays proposal results", async () => {
-    const proposalAccount = await program.account.proposal.fetch(proposal);
-
-    console.log("Proposal description:", proposalAccount.description);
-    console.log("Votes for:", proposalAccount.votesFor);
-    console.log("Votes against:", proposalAccount.votesAgainst);
-    console.log("Proposal closed:", proposalAccount.closed);
-    
-    assert.equal(proposalAccount.description, "Proposal description");
-    assert.equal(proposalAccount.votesFor, 1);
-    assert.equal(proposalAccount.votesAgainst, 0);
-    assert.isTrue(proposalAccount.closed);
+  it("Prevents voting on a closed proposal", async () => {
+    try {
+      await program.methods
+        .vote(true)
+        .accounts({
+          dao: dao,
+          proposal: proposal,
+          rewardVault: rewardVault,
+          userTokenAccount: user1TokenAccount,
+          rewardMint: rewardMint,
+          user: user1.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .signers([user1])
+        .rpc();
+      expect.fail("Should have thrown an error");
+    } catch (error) {
+      expect(error.message).to.include("The proposal is not active");
+    }
   });
 });
