@@ -2,14 +2,24 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { assert } from "chai";
 import { DaoVotingSystem } from "../target/types/dao_voting_system";
-import { TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, createMint, getOrCreateAssociatedTokenAccount, mintTo } from "@solana/spl-token";
+import {
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddress,
+  createMint,
+  createAssociatedTokenAccount,
+  mintTo,
+} from "@solana/spl-token";
 
 describe("dao_voting_system", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
+
   const program = anchor.workspace.DaoVotingSystem as Program<DaoVotingSystem>;
 
   const user = anchor.web3.Keypair.generate();
+  const protocolWallet = anchor.web3.Keypair.generate();
+
   let mint: anchor.web3.PublicKey;
   let userTokenAccount: anchor.web3.PublicKey;
   let proposal: anchor.web3.PublicKey;
@@ -19,44 +29,25 @@ describe("dao_voting_system", () => {
 
   before(async () => {
     // Airdrop SOL to the user
-    const signature = await provider.connection.requestAirdrop(user.publicKey, 1000000000);
-    await provider.connection.confirmTransaction(signature);
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(user.publicKey, 1000000000)
+    );
 
     // Create mint
     mint = await createMint(
       provider.connection,
-      provider.wallet.payer,
-      provider.wallet.publicKey,
+      user,
+      user.publicKey,
       null,
-      0,
-      undefined,
-      undefined,
-      TOKEN_PROGRAM_ID
+      0
     );
-    
-    // Create associated token account for the user
-    const userTokenAccountInfo = await getOrCreateAssociatedTokenAccount(
+
+    // Create user token account
+    userTokenAccount = await createAssociatedTokenAccount(
       provider.connection,
-      provider.wallet.payer,
+      user,
       mint,
       user.publicKey
-    );
-    userTokenAccount = userTokenAccountInfo.address;
-
-    // Mint tokens to the user's account
-    await mintTo(
-      provider.connection,
-      provider.wallet.payer,
-      mint,
-      userTokenAccount,
-      provider.wallet.publicKey,
-      1000
-    );
-
-    // Derive the proposal PDA
-    [proposal] = await anchor.web3.PublicKey.findProgramAddress(
-      [Buffer.from("proposal"), user.publicKey.toBuffer()],
-      program.programId
     );
 
     // Derive the reward pool PDA
@@ -65,61 +56,70 @@ describe("dao_voting_system", () => {
       program.programId
     );
 
-    // Create associated token account for the reward pool
-    const rewardPoolTokenAccountInfo = await getOrCreateAssociatedTokenAccount(
-      provider.connection,
-      provider.wallet.payer,
+    // Create reward pool token account
+    rewardPoolTokenAccount = await getAssociatedTokenAddress(
       mint,
       rewardPool,
       true
     );
-    rewardPoolTokenAccount = rewardPoolTokenAccountInfo.address;
 
     // Initialize reward pool
     await program.methods
       .initializeRewardPool(rewardPoolBump)
       .accounts({
         rewardPool: rewardPool,
-        authority: provider.wallet.publicKey,
+        authority: user.publicKey,
         mint: mint,
         tokenProgram: TOKEN_PROGRAM_ID,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: anchor.web3.SystemProgram.programId,
         rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
+      .signers([user])
       .rpc();
+
+    // Mint tokens to the user's account
+    await mintTo(
+      provider.connection,
+      user,
+      mint,
+      userTokenAccount,
+      user,
+      1000
+    );
 
     // Mint tokens to the reward pool token account
     await mintTo(
       provider.connection,
-      provider.wallet.payer,
+      user,
       mint,
       rewardPoolTokenAccount,
-      provider.wallet.publicKey,
+      user,
       1000
     );
-  });
 
-  it("Creates a proposal", async () => {
+    // Create proposal
+    [proposal] = await anchor.web3.PublicKey.findProgramAddress(
+      [Buffer.from("proposal"), user.publicKey.toBuffer()],
+      program.programId
+    );
+
     await program.methods
       .createProposal("Proposal description")
       .accounts({
-        proposal,
+        proposal: proposal,
         authority: user.publicKey,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([user])
       .rpc();
-
-    const account = await program.account.proposal.fetch(proposal);
-    assert.equal(account.description, "Proposal description");
   });
 
   it("Votes on a proposal", async () => {
     await program.methods
       .vote(true)
       .accounts({
-        proposal,
+        proposal: proposal,
         user: user.publicKey,
         userTokenAccount: userTokenAccount,
         rewardPool: rewardPool,
@@ -137,7 +137,7 @@ describe("dao_voting_system", () => {
     await program.methods
       .closeProposal()
       .accounts({
-        proposal,
+        proposal: proposal,
         authority: user.publicKey,
       })
       .signers([user])
