@@ -22,10 +22,6 @@ Before you begin, ensure you have met the following requirements:
 ## Installation
 
 1. Clone the repository:
-
-## Installation
-
-1. Clone the repository:
     ```sh
     git clone git@github.com:0xCipherCoder/dao-voting-system.git
     cd dao-voting-system
